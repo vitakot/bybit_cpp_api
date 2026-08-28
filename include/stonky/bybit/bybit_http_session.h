@@ -18,18 +18,34 @@ Copyright (c) 2022 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <nlohmann/json_fwd.hpp>
 
 namespace stonky::bybit {
+/// Default bound for the blocking socket operations of a single request
+static constexpr int DEFAULT_REQUEST_TIMEOUT_MS = 10000;
+
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace net = boost::asio;
 
 /**
- * Thrown when a request fails on the transport level - name resolution, TCP, TLS or a timeout. In contrast to an API
- * error this means the outcome is UNKNOWN: an order may or may not have reached the exchange, so the caller must not
- * treat it as a rejection.
+ * Base of every failure that leaves the outcome of the request UNKNOWN: it may or may not have been executed by the
+ * exchange. An order that fails this way must never be treated as rejected - it has to be reconciled by querying it
+ * back, otherwise a retry silently doubles the position.
  */
-class TransportError final : public std::runtime_error {
+class UnknownOutcomeError : public std::runtime_error {
 public:
-    explicit TransportError(const std::string& message) : std::runtime_error(message) {}
+    explicit UnknownOutcomeError(const std::string& message) : std::runtime_error(message) {}
+};
+
+/// The request failed on the transport level - name resolution, TCP, TLS or a timeout
+class TransportError final : public UnknownOutcomeError {
+public:
+    explicit TransportError(const std::string& message) : UnknownOutcomeError(message) {}
+};
+
+/// The exchange answered with a status that leaves the execution state open - the HTTP 5xx family and Bybit's
+/// internal server errors
+class ExecutionUnknown final : public UnknownOutcomeError {
+public:
+    explicit ExecutionUnknown(const std::string& message) : UnknownOutcomeError(message) {}
 };
 
 class HTTPSession {
@@ -44,6 +60,18 @@ public:
     [[nodiscard]] http::response<http::string_body> get(const std::string& path, const std::map<std::string, std::string>& parameters) const;
 
     [[nodiscard]] http::response<http::string_body> post(const std::string& path, const nlohmann::json& json) const;
+
+    /**
+     * Wall clock time in ms of the last response that was received in full. Zero when nothing has been received yet.
+     * Lets callers judge whether the connection is alive without issuing a probe request of their own.
+     */
+    [[nodiscard]] std::int64_t lastSuccessfulResponseMs() const;
+
+    /**
+     * Bound for the blocking socket operations of a single request, see applySocketTimeout for the platform caveat.
+     * @param timeoutMs 0 or less leaves the operating system defaults in place
+     */
+    void setRequestTimeout(int timeoutMs) const;
 };
 } // namespace stonky::bybit
 #endif // INCLUDE_STONKY_BYBIT_HTTP_SESSION_H

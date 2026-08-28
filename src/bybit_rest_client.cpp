@@ -21,14 +21,25 @@ Copyright (c) 2022 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <boost/multiprecision/cpp_dec_float.hpp>
 
 namespace stonky::bybit {
+/// Bybit answers that leave the execution state open: an order may still have been accepted
+static bool isExecutionUnknownCode(const int retCode) {
+	/// 10016 internal server error, 170007 timeout waiting for the backend
+	return retCode == 10016 || retCode == 170007;
+}
+
 template<typename ValueType>
 ValueType handleBybitResponse(const http::response<http::string_body> &response) {
 	ValueType retVal;
 	retVal.fromJson(nlohmann::json::parse(response.body()));
 
 	if (retVal.retCode != 0) {
-		throw std::runtime_error(
-			fmt::format("Bybit API error, code: {}, msg: {}", retVal.retCode, retVal.retMsg).c_str());
+		const auto msg = fmt::format("Bybit API error, code: {}, msg: {}", retVal.retCode, retVal.retMsg);
+
+		if (isExecutionUnknownCode(retVal.retCode)) {
+			throw ExecutionUnknown(msg);
+		}
+
+		throw std::runtime_error(msg);
 	}
 
 	return retVal;
@@ -121,8 +132,32 @@ private:
 public:
 	RESTClient *parent = nullptr;
 	std::string host; /// REST host per Environment; empty = mainnet default
-	std::shared_ptr<HTTPSession> httpSession;
-	mutable std::shared_ptr<HTTPSession> publicHttpSession;
+
+	/// Replaced by setCredentials (and, for the public one, by the download retries) while other threads may be
+	/// issuing requests. A plain shared_ptr would be read and reassigned concurrently - a data race, and with the
+	/// reset() that preceded the assignment even a window with a null pointer.
+	std::atomic<std::shared_ptr<HTTPSession> > httpSession;
+	mutable std::atomic<std::shared_ptr<HTTPSession> > publicHttpSession;
+
+	[[nodiscard]] std::shared_ptr<HTTPSession> session() const {
+		auto current = httpSession.load();
+
+		if (!current) {
+			throw std::runtime_error("Bybit REST session is not initialized");
+		}
+
+		return current;
+	}
+
+	[[nodiscard]] std::shared_ptr<HTTPSession> publicSession() const {
+		auto current = publicHttpSession.load();
+
+		if (!current) {
+			throw std::runtime_error("Bybit public REST session is not initialized");
+		}
+
+		return current;
+	}
 	mutable RateLimiter rateLimiter;
 
 	explicit P(RESTClient *parent) {
@@ -187,7 +222,7 @@ public:
 		constexpr int maxRetries = 3;
 		for (int attempt = 0; attempt < maxRetries; ++attempt) {
 			try {
-				const auto dirResponse = publicHttpSession->get("/spot/" + symbol + "/", {});
+				const auto dirResponse = publicSession()->get("/spot/" + symbol + "/", {});
 				const std::string &body = dirResponse.body();
 				// Files are named e.g. VRAUSDT_2026-02-18.csv.gz
 				const std::regex fileRegex(symbol + R"re(_(\d{4}-\d{2}-\d{2})\.csv\.gz)re");
@@ -204,7 +239,7 @@ public:
 				if (latestFilename.empty()) {
 					return 0;
 				}
-				const auto fileResponse = publicHttpSession->get(
+				const auto fileResponse = publicSession()->get(
 					"/spot/" + symbol + "/" + latestFilename, {});
 				const std::string decompressed = decompressGzip(fileResponse.body());
 				return lastCsvTimestamp(decompressed);
@@ -228,7 +263,7 @@ public:
 		constexpr int maxRetries = 3;
 		for (int attempt = 0; attempt < maxRetries; ++attempt) {
 			try {
-				const auto response = publicHttpSession->get("/spot/", {});
+				const auto response = publicSession()->get("/spot/", {});
 				const std::string &body = response.body();
 				std::vector<std::string> symbols;
 				const std::regex linkRegex(R"re(href="([A-Z0-9]+)")re");
@@ -315,8 +350,14 @@ public:
         rateLimiter.update(response);
 
 		if (response.result() != http::status::ok) {
-			throw std::runtime_error(
-				fmt::format("Bad response, code {}, msg: {}", response.result_int(), response.body()).c_str());
+			const auto msg = fmt::format("Bad response, code {}, msg: {}", response.result_int(), response.body());
+
+			/// The 5xx family means the exchange had a problem after receiving the request - the outcome is unknown
+			if (response.result_int() >= 500) {
+				throw ExecutionUnknown(msg);
+			}
+
+			throw std::runtime_error(msg);
 		}
 		return response;
 	}
@@ -341,7 +382,7 @@ public:
         // Wait if rate limited
         rateLimiter.wait();
 
-		const auto response = checkResponse(httpSession->get(path, parameters));
+		const auto response = checkResponse(session()->get(path, parameters));
 		return handleBybitResponse<Candles>(response).candles;
 	}
 
@@ -364,7 +405,7 @@ public:
         // Wait if rate limited
         rateLimiter.wait();
 
-		const auto response = checkResponse(httpSession->get(path, parameters));
+		const auto response = checkResponse(session()->get(path, parameters));
 		return handleBybitResponse<FundingRates>(response).fundingRates;
 	}
 
@@ -390,7 +431,7 @@ public:
         // Wait if rate limited
         rateLimiter.wait();
 
-		const auto response = checkResponse(httpSession->get(path, parameters));
+		const auto response = checkResponse(session()->get(path, parameters));
 		return handleBybitResponse<Instruments>(response);
 	}
 };
@@ -418,7 +459,7 @@ RESTClient::RESTClient(const std::string &apiKey, const std::string &apiSecret, 
 RESTClient::~RESTClient() = default;
 
 void RESTClient::setCredentials(const std::string &apiKey, const std::string &apiSecret) const {
-	m_p->httpSession.reset();
+	/// Single atomic swap - a request already in flight keeps the old session alive through its own shared_ptr copy
 	m_p->httpSession = std::make_shared<HTTPSession>(apiKey, apiSecret, m_p->host);
 }
 
@@ -503,7 +544,7 @@ WalletBalance RESTClient::getWalletBalance(const AccountType accountType, const 
 	}
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->get(path, parameters));
+	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
 	return handleBybitResponse<WalletBalance>(response);
 }
 
@@ -512,7 +553,7 @@ std::int64_t RESTClient::getServerTime() const {
 	const std::map<std::string, std::string> parameters;
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->get(path, parameters));
+	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
 	const auto timeResponse = handleBybitResponse<ServerTime>(response);
 
 	return timeResponse.timeNano / 1000000;
@@ -536,7 +577,7 @@ std::vector<Position> RESTClient::getPositionInfo(const Category category, const
 	}
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->get(path, parameters));
+	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
 	return handleBybitResponse<Positions>(response).positions;
 }
 
@@ -664,7 +705,7 @@ bool RESTClient::setPositionMode(Category category,
 	payload["mode"] = positionMode;
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->post(path, payload));
+	const auto response = m_p->checkResponse(m_p->session()->post(path, payload));
 
 	try {
 		/// retCode == 0 is the success authority (handleBybitResponse throws
@@ -701,7 +742,7 @@ OrderId RESTClient::placeOrder(Order &order) const {
 	order.qtyStep = qtyStep;
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->post(path, order.toJson()));
+	const auto response = m_p->checkResponse(m_p->session()->post(path, order.toJson()));
 	return handleBybitResponse<OrderId>(response);
 }
 
@@ -746,7 +787,7 @@ OrderId RESTClient::amendOrder(const Category category,
 	}
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->post(path, payload));
+	const auto response = m_p->checkResponse(m_p->session()->post(path, payload));
 	return handleBybitResponse<OrderId>(response);
 }
 
@@ -757,7 +798,7 @@ std::vector<OrderResponse> RESTClient::getOpenOrders(const Category category, co
 	parameters.insert_or_assign("symbol", symbol);
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->get(path, parameters));
+	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
 	return handleBybitResponse<OrdersResponse>(response).orders;
 }
 
@@ -781,7 +822,7 @@ RESTClient::getOpenOrder(const Category category,
 	}
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->get(path, parameters));
+	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
 
 	if (auto orders = handleBybitResponse<OrdersResponse>(response).orders; !orders.empty()) {
 		return orders.front();
@@ -804,7 +845,7 @@ std::vector<EventExecution> RESTClient::getExecutions(const Category category, c
 	}
 
 	m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->get(path, parameters));
+	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
 	const auto result = handleBybitResponse<Response>(response).result;
 
 	std::vector<EventExecution> executions;
@@ -832,7 +873,7 @@ std::vector<OrderId> RESTClient::cancelAllOrders(Category category, const std::s
 	}
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->post(path, nlohmann::json(parameters)));
+	const auto response = m_p->checkResponse(m_p->session()->post(path, nlohmann::json(parameters)));
 
 	for (const auto res = handleBybitResponse<Response>(response).result; const auto &el: res["list"].
 	     items()) {
@@ -863,12 +904,20 @@ OrderId RESTClient::cancelOrder(const Category category,
 	}
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->post(path, nlohmann::json(parameters)));
+	const auto response = m_p->checkResponse(m_p->session()->post(path, nlohmann::json(parameters)));
 	return handleBybitResponse<OrderId>(response);
 }
 
 void RESTClient::setInstruments(const std::vector<Instrument> &instruments) const {
 	m_p->setInstruments(instruments);
+}
+
+std::int64_t RESTClient::lastSuccessfulResponseMs() const {
+	return m_p->session()->lastSuccessfulResponseMs();
+}
+
+void RESTClient::setRequestTimeout(const int timeoutMs) const {
+	m_p->session()->setRequestTimeout(timeoutMs);
 }
 
 void RESTClient::closeAllPositions(const Category category, const std::string &settleCoin) const {
@@ -926,7 +975,7 @@ Tickers RESTClient::getTickers(const Category category, const std::string &symbo
 	parameters.insert_or_assign("symbol", symbol);
 
     m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->httpSession->get(path, parameters));
+	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
 	return handleBybitResponse<Tickers>(response);
 }
 }
