@@ -21,10 +21,27 @@ Copyright (c) 2022 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <boost/multiprecision/cpp_dec_float.hpp>
 
 namespace stonky::bybit {
-/// Bybit answers that leave the execution state open: an order may still have been accepted
+namespace {
+std::int64_t nextCandleStart(const std::int64_t openTimestampMs, const CandleInterval interval) {
+    if (interval != CandleInterval::_M) {
+        return openTimestampMs + Bybit::numberOfMsForCandleInterval(interval);
+    }
+
+    using namespace std::chrono;
+    const sys_time<milliseconds> open{milliseconds{openTimestampMs}};
+    const year_month_day current{floor<days>(open)};
+    const year_month_day next = current.year() / current.month() / day{1} + months{1};
+    return duration_cast<milliseconds>(sys_days{next}.time_since_epoch()).count();
+}
+} // namespace
+
+/// Bybit answers whose outcome is UNKNOWN - the request may still have been executed. Same set that the execution
+/// gateway recognizes by message text in isAmbiguousOutcomeReason(); the typed exception lets callers that do not
+/// go through the gateway (the Zorro plugin) catch it without matching strings. Keep the two in sync, and never
+/// change the wording of the messages below - the gateway parses it.
 static bool isExecutionUnknownCode(const int retCode) {
-	/// 10016 internal server error, 170007 timeout waiting for the backend
-	return retCode == 10016 || retCode == 170007;
+	/// 10000 server timeout, 10016 internal server error, 170007 timeout waiting for the backend
+	return retCode == 10000 || retCode == 10016 || retCode == 170007;
 }
 
 template<typename ValueType>
@@ -132,7 +149,6 @@ private:
 public:
 	RESTClient *parent = nullptr;
 	std::string host; /// REST host per Environment; empty = mainnet default
-
 	/// Replaced by setCredentials (and, for the public one, by the download retries) while other threads may be
 	/// issuing requests. A plain shared_ptr would be read and reassigned concurrently - a data race, and with the
 	/// reset() that preceded the assignment even a window with a null pointer.
@@ -158,6 +174,7 @@ public:
 
 		return current;
 	}
+
 	mutable RateLimiter rateLimiter;
 
 	explicit P(RESTClient *parent) {
@@ -496,7 +513,7 @@ RESTClient::getHistoricalPrices(const Category category,
 		// Pop the last candle only if its interval overlaps with 'to' — i.e. it is the
 		// current in-progress candle for active symbols.  For delisted symbols whose
 		// last candle lies far in the past this condition is false, so T_last is kept.
-		if (candles.back().startTime + Bybit::numberOfMsForCandleInterval(interval) > to) {
+		if (nextCandleStart(candles.back().startTime, interval) > to) {
 			candles.pop_back();
 		}
 
@@ -521,7 +538,7 @@ RESTClient::getHistoricalPrices(const Category category,
 		}
 
 		retVal.insert(retVal.end(), candles.begin(), candles.end());
-		from = last.startTime + Bybit::numberOfMsForCandleInterval(interval);
+		from = nextCandleStart(last.startTime, interval);
 
 		if (writer) {
 			writer(candles);
@@ -561,24 +578,43 @@ std::int64_t RESTClient::getServerTime() const {
 
 std::vector<Position> RESTClient::getPositionInfo(const Category category, const std::string &symbol, const std::string &settleCoin) const {
 	const std::string path = "/v5/position/list";
-	std::map<std::string, std::string> parameters;
 
-	parameters.insert_or_assign("category", magic_enum::enum_name(category));
+	// Bybit pages this endpoint (default 20, max 200) — a book of 2×10 legs
+	// plus a single straggler already overflows the default page, and a
+	// silently-missing position corrupts every caller that treats the snapshot
+	// as venue truth. Any page failure throws, so the caller never sees a
+	// partial book.
+	std::vector<Position> positions;
+	std::string cursor;
 
-	if (!symbol.empty()) {
-		parameters.insert_or_assign("symbol", symbol);
-	}
+	do {
+		std::map<std::string, std::string> parameters;
+		parameters.insert_or_assign("category", magic_enum::enum_name(category));
+		parameters.insert_or_assign("limit", "200");
 
-	// Linear/inverse require symbol OR settleCoin OR baseCoin when listing all
-	// positions; without one Bybit returns retCode 10001 ("Missing some
-	// parameters that must be filled in, symbol or settleCoin").
-	if (!settleCoin.empty()) {
-		parameters.insert_or_assign("settleCoin", settleCoin);
-	}
+		if (!symbol.empty()) {
+			parameters.insert_or_assign("symbol", symbol);
+		}
 
-    m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
-	return handleBybitResponse<Positions>(response).positions;
+		// Linear/inverse require symbol OR settleCoin OR baseCoin when listing all
+		// positions; without one Bybit returns retCode 10001 ("Missing some
+		// parameters that must be filled in, symbol or settleCoin").
+		if (!settleCoin.empty()) {
+			parameters.insert_or_assign("settleCoin", settleCoin);
+		}
+
+		if (!cursor.empty()) {
+			parameters.insert_or_assign("cursor", cursor);
+		}
+
+		m_p->rateLimiter.wait();
+		const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
+		auto page = handleBybitResponse<Positions>(response);
+		positions.insert(positions.end(), page.positions.begin(), page.positions.end());
+		cursor = page.nextPageCursor;
+	} while (!cursor.empty());
+
+	return positions;
 }
 
 std::vector<Instrument>
@@ -791,15 +827,40 @@ OrderId RESTClient::amendOrder(const Category category,
 	return handleBybitResponse<OrderId>(response);
 }
 
-std::vector<OrderResponse> RESTClient::getOpenOrders(const Category category, const std::string &symbol) const {
+std::vector<OrderResponse> RESTClient::getOpenOrders(const Category category, const std::string &symbol, const std::string &settleCoin) const {
 	const std::string path = "/v5/order/realtime";
-	std::map<std::string, std::string> parameters;
-	parameters.insert_or_assign("category", magic_enum::enum_name(category));
-	parameters.insert_or_assign("symbol", symbol);
 
-    m_p->rateLimiter.wait();
-	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
-	return handleBybitResponse<OrdersResponse>(response).orders;
+	// Bybit pages this endpoint (default 20, max 50) — iterate the cursor so a
+	// caller sweeping stray orders sees ALL of them. A page failure throws;
+	// partial data is never returned.
+	std::vector<OrderResponse> orders;
+	std::string cursor;
+
+	do {
+		std::map<std::string, std::string> parameters;
+		parameters.insert_or_assign("category", magic_enum::enum_name(category));
+		parameters.insert_or_assign("limit", "50");
+
+		if (!symbol.empty()) {
+			parameters.insert_or_assign("symbol", symbol);
+		}
+
+		if (!settleCoin.empty()) {
+			parameters.insert_or_assign("settleCoin", settleCoin);
+		}
+
+		if (!cursor.empty()) {
+			parameters.insert_or_assign("cursor", cursor);
+		}
+
+		m_p->rateLimiter.wait();
+		const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
+		auto page = handleBybitResponse<OrdersResponse>(response);
+		orders.insert(orders.end(), page.orders.begin(), page.orders.end());
+		cursor = page.nextPageCursor;
+	} while (!cursor.empty());
+
+	return orders;
 }
 
 std::optional<OrderResponse>

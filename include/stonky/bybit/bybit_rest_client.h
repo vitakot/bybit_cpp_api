@@ -153,14 +153,19 @@ public:
                                      double price, double qty = 0.0) const;
 
     /**
-     * Get open orders list
+     * Get open orders list. Paginated internally (limit=50 + cursor) so the
+     * full set is always returned; a page failure throws — partial data is
+     * never returned.
      * @param category i.e. Spot, Linear...
-     * @param symbol e.g. BTCUSDT
+     * @param symbol e.g. BTCUSDT; may be empty when settleCoin is set
+     * @param settleCoin e.g. USDT — lists open orders across ALL symbols of
+     *        the settle coin (linear/inverse accept settleCoin instead of
+     *        symbol)
      * @throws nlohmann::json::exception, std::exception
      * @return vector of OrderResponse structures
      * @see https://bybit-exchange.github.io/docs/v5/order/open-order
      */
-    [[nodiscard]] std::vector<OrderResponse> getOpenOrders(Category category, const std::string& symbol) const;
+    [[nodiscard]] std::vector<OrderResponse> getOpenOrders(Category category, const std::string& symbol, const std::string& settleCoin = "") const;
 
     /**
      * Get open order. Because order creation/cancellation is asynchronous, there can be a data delay in this
@@ -227,7 +232,7 @@ public:
 
     /**
      * Bound for the blocking socket operations of a single request
-     * @param timeoutMs 0 or less leaves the operating system defaults in place
+     * @param timeoutMs 0 or less falls back to the built in stall timeout
      */
     void setRequestTimeout(int timeoutMs) const;
 

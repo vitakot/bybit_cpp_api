@@ -16,6 +16,10 @@ Copyright (c) 2022 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <boost/beast/version.hpp>
 #include <openssl/hmac.h>
 #include <spdlog/spdlog.h>
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/time.h>
+#endif
 #include <atomic>
 #include <limits>
 
@@ -29,32 +33,31 @@ auto API_TESTNET_URI = "api-testnet.bybit.com";
 /// How often the local clock is re-synchronized against the exchange clock
 static constexpr std::int64_t TIME_SYNC_INTERVAL_MS = 30 * 60 * 1000;
 
-/// How long a delayed request may still be executed by the exchange. Bybit defaults to 5000 ms; a wide window would
-/// let a badly delayed order still be executed, which the time synchronization makes unnecessary.
-static constexpr int RECV_WINDOW_MS = 5000;
+/// Stall timeout for every blocking socket syscall (connect, TLS handshake,
+/// write, each read). Without it a dead peer/black-holed route blocks the
+/// calling worker for the OS default (minutes) — past funding cutoffs and
+/// scheduler slots the chase deadlines are supposed to protect. Applied per
+/// syscall, so a large-but-flowing archive download never trips it; only a
+/// genuine stall does. Timeouts surface as boost system_errors inside the
+/// request try-block → TransportError (outcome unknown), which is exactly
+/// right: a timed-out order POST may still have been executed.
+///
+/// The connect itself is only bounded on POSIX, where a blocking connect honors SO_SNDTIMEO; Windows falls back to
+/// the operating system connect timeout there. On Windows SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds
+/// instead of a timeval, and the winsock declarations come in through Boost.Asio, which must be included first.
+static constexpr int IO_STALL_TIMEOUT_S = 15;
 
-/**
- * Bound the blocking socket operations. Beast's synchronous calls carry no timeout of their own, so a black holed
- * connection blocks the calling thread - in the Zorro plugin that is the thread driving the whole strategy.
- *
- * NOTE: this is effective on Windows, where a timed out recv/send reports WSAETIMEDOUT and Asio surfaces it as an
- * error. On POSIX the same condition arrives as EAGAIN, which Asio cannot tell from a non-blocking would-block and
- * therefore polls and retries - there the call still blocks. Bounding POSIX as well needs the synchronous request
- * path rewritten to async operations driven by io_context::run_for.
- */
-void applySocketTimeout(net::ip::tcp::socket& socket, const int timeoutMs) {
-    if (timeoutMs <= 0) {
-        return;
-    }
+namespace {
+/// @param timeoutMs per syscall bound; 0 or less falls back to IO_STALL_TIMEOUT_S
+void setSocketStallTimeouts(tcp::socket& socket, const int timeoutMs) {
+    const auto effectiveMs = timeoutMs > 0 ? timeoutMs : IO_STALL_TIMEOUT_S * 1000;
 
 #ifdef _WIN32
-    const DWORD value = static_cast<DWORD>(timeoutMs);
+    const DWORD value = static_cast<DWORD>(effectiveMs);
     const auto data = reinterpret_cast<const char*>(&value);
     const int size = sizeof(value);
 #else
-    timeval value{};
-    value.tv_sec = timeoutMs / 1000;
-    value.tv_usec = timeoutMs % 1000 * 1000;
+    const timeval value{.tv_sec = effectiveMs / 1000, .tv_usec = effectiveMs % 1000 * 1000};
     const auto data = reinterpret_cast<const void*>(&value);
     const socklen_t size = sizeof(value);
 #endif
@@ -62,11 +65,14 @@ void applySocketTimeout(net::ip::tcp::socket& socket, const int timeoutMs) {
     ::setsockopt(socket.native_handle(), SOL_SOCKET, SO_RCVTIMEO, data, size);
     ::setsockopt(socket.native_handle(), SOL_SOCKET, SO_SNDTIMEO, data, size);
 }
+} // namespace
 
 struct HTTPSession::P {
     net::io_context ioc;
     std::string apiKey;
-    int receiveWindow = RECV_WINDOW_MS;
+    /// Bybit's own default. A wider window only means that a badly delayed request can still be executed, which
+    /// the clock synchronization below makes unnecessary.
+    int receiveWindow = 5000;
     std::string apiSecret;
     std::string uri;
     const EVP_MD* evpMd;
@@ -76,7 +82,7 @@ struct HTTPSession::P {
     mutable std::atomic<std::int64_t> timeOffsetMs{0};
     mutable std::atomic<std::int64_t> lastTimeSyncMs{0};
     std::atomic<std::int64_t> lastSuccessMs{0};
-    std::atomic<int> requestTimeoutMs{DEFAULT_REQUEST_TIMEOUT_MS};
+    std::atomic<int> requestTimeoutMs{IO_STALL_TIMEOUT_S * 1000};
     const HTTPSession* parent{nullptr};
 
     P() : evpMd(EVP_sha256()) {}
@@ -265,8 +271,36 @@ http::response<http::string_body> HTTPSession::P::request(http::request<http::st
     /// must be able to tell that apart from a rejection, hence the dedicated exception type.
     try {
         auto const results = resolver.resolve(uri, "443");
-        net::connect(stream.next_layer(), results.begin(), results.end());
-        applySocketTimeout(stream.next_layer(), requestTimeoutMs);
+
+        /// Manual endpoint loop instead of net::connect: the stall timeouts
+        /// must be set on the OPEN socket before connect so they also bound
+        /// the connect itself (Linux honors SO_SNDTIMEO for blocking connect).
+        auto& socket = stream.next_layer();
+        boost::system::error_code connectEc = net::error::host_not_found;
+
+        for (const auto& entry: results) {
+            boost::system::error_code ec;
+            socket.close(ec);
+            socket.open(entry.endpoint().protocol(), ec);
+
+            if (ec) {
+                connectEc = ec;
+                continue;
+            }
+
+            setSocketStallTimeouts(socket, requestTimeoutMs);
+            socket.connect(entry.endpoint(), ec);
+            connectEc = ec;
+
+            if (!ec) {
+                break;
+            }
+        }
+
+        if (connectEc) {
+            throw boost::system::system_error{connectEc};
+        }
+
         stream.handshake(ssl::stream_base::client);
         http::write(stream, req);
         http::read(stream, buffer, parser);
