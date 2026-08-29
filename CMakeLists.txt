@@ -80,4 +80,7 @@ if (ENABLE_TESTS)
     target_link_libraries(bybit_exec_probe PRIVATE spdlog::spdlog_header_only bybit_api)
 endif ()
 
-target_link_libraries(bybit_api PRIVATE spdlog::spdlog_header_only OpenSSL::Crypto OpenSSL::SSL ZLIB::ZLIB stonky_common nlohmann_json::nlohmann_json)
+# stonky_common is PUBLIC on purpose: the public headers of this library include stonky/interface and
+# stonky/utils headers, so every consumer needs its include directories, not just this target.
+target_link_libraries(bybit_api PRIVATE spdlog::spdlog_header_only OpenSSL::Crypto OpenSSL::SSL ZLIB::ZLIB nlohmann_json::nlohmann_json)
+target_link_libraries(bybit_api PUBLIC stonky_common)

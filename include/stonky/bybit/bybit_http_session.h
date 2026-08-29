@@ -48,6 +48,15 @@ public:
     explicit ExecutionUnknown(const std::string& message) : UnknownOutcomeError(message) {}
 };
 
+/**
+ * The exchange answered definitively that it does not know the order. Unlike every other error this DOES settle the
+ * question: the order never reached the matching engine, so the caller may treat it as never placed.
+ */
+class OrderNotFound final : public std::runtime_error {
+public:
+    explicit OrderNotFound(const std::string& message) : std::runtime_error(message) {}
+};
+
 class HTTPSession {
     struct P;
     std::unique_ptr<P> m_p{};

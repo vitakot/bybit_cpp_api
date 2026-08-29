@@ -44,6 +44,12 @@ static bool isExecutionUnknownCode(const int retCode) {
 	return retCode == 10000 || retCode == 10016 || retCode == 170007;
 }
 
+/// The one answer that settles the question instead of leaving it open: the venue does not know the order
+static bool isOrderNotFoundCode(const int retCode) {
+	/// 110001 order does not exist (derivatives), 170213 the same for spot
+	return retCode == 110001 || retCode == 170213;
+}
+
 template<typename ValueType>
 ValueType handleBybitResponse(const http::response<http::string_body> &response) {
 	ValueType retVal;
@@ -54,6 +60,10 @@ ValueType handleBybitResponse(const http::response<http::string_body> &response)
 
 		if (isExecutionUnknownCode(retVal.retCode)) {
 			throw ExecutionUnknown(msg);
+		}
+
+		if (isOrderNotFoundCode(retVal.retCode)) {
+			throw OrderNotFound(msg);
 		}
 
 		throw std::runtime_error(msg);
