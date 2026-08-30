@@ -182,6 +182,22 @@ public:
                  const std::string& orderLinkId) const;
 
     /**
+     * Get a finished order from the order history. /v5/order/realtime only serves orders that are still working, so
+     * an order that filled or was cancelled has to be looked up here - this endpoint is what settles its terminal
+     * state, which an empty realtime answer on its own does not.
+     * @param category i.e. Spot, Linear...
+     * @param symbol e.g. BTCUSDT
+     * @param orderId Venue order id; may be empty when orderLinkId is set
+     * @param orderLinkId User-set order id; may be empty when orderId is set
+     * @return the order record, or bad option when the history does not hold it (yet)
+     * @throws nlohmann::json::exception, std::exception
+     * @see https://bybit-exchange.github.io/docs/v5/order/order-list
+     */
+    [[nodiscard]] std::optional<OrderResponse>
+    getOrderHistory(Category category, const std::string& symbol, const std::string& orderId,
+                    const std::string& orderLinkId) const;
+
+    /**
      * Get an order's executions (trade history) — used to reconcile fills the
      * private WS may have dropped during a reconnect gap. Query by orderLinkId
      * to fetch every fill of one order; each carries a stable execId that the

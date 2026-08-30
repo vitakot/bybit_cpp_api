@@ -9,6 +9,7 @@ Copyright (c) 2022 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/bybit/bybit_rest_client.h"
 #include "stonky/bybit/bybit_http_session.h"
 #include "stonky/bybit/bybit.h"
+#include "stonky/utils/json_utils.h"
 #include "stonky/utils/utils.h"
 #include <mutex>
 #include <thread>
@@ -902,13 +903,22 @@ RESTClient::getOpenOrder(const Category category,
 	return {};
 }
 
-std::vector<EventExecution> RESTClient::getExecutions(const Category category, const std::string &symbol, const std::string &orderLinkId) const {
-	const std::string path = "/v5/execution/list";
+std::optional<OrderResponse>
+RESTClient::getOrderHistory(const Category category,
+                            const std::string &symbol,
+                            const std::string &orderId,
+                            const std::string &orderLinkId) const {
+	const std::string path = "/v5/order/history";
 	std::map<std::string, std::string> parameters;
 	parameters.insert_or_assign("category", magic_enum::enum_name(category));
 
 	if (!symbol.empty()) {
 		parameters.insert_or_assign("symbol", symbol);
+	}
+
+	/// Empty parameters must not be sent at all - Bybit rejects an empty orderId/orderLinkId value
+	if (!orderId.empty()) {
+		parameters.insert_or_assign("orderId", orderId);
 	}
 
 	if (!orderLinkId.empty()) {
@@ -917,16 +927,63 @@ std::vector<EventExecution> RESTClient::getExecutions(const Category category, c
 
 	m_p->rateLimiter.wait();
 	const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
-	const auto result = handleBybitResponse<Response>(response).result;
+
+	if (auto orders = handleBybitResponse<OrdersResponse>(response).orders; !orders.empty()) {
+		return orders.front();
+	}
+
+	return {};
+}
+
+std::vector<EventExecution> RESTClient::getExecutions(const Category category, const std::string &symbol, const std::string &orderLinkId) const {
+	const std::string path = "/v5/execution/list";
+
+	/// One order can fill in more pieces than a single page holds - Bybit defaults to 50 and hands out the rest
+	/// through nextPageCursor. Reading only the first page would silently understate the fill.
+	static constexpr int PAGE_LIMIT = 100;
+	static constexpr int MAX_PAGES = 20;
 
 	std::vector<EventExecution> executions;
+	std::string cursor;
 
-	if (result.contains("list") && result["list"].is_array()) {
-		for (const auto &el: result["list"]) {
-			EventExecution execution;
-			execution.fromJson(el);
-			executions.push_back(execution);
+	for (int page = 0; page < MAX_PAGES; page++) {
+		std::map<std::string, std::string> parameters;
+		parameters.insert_or_assign("category", magic_enum::enum_name(category));
+		parameters.insert_or_assign("limit", std::to_string(PAGE_LIMIT));
+
+		if (!symbol.empty()) {
+			parameters.insert_or_assign("symbol", symbol);
 		}
+
+		if (!orderLinkId.empty()) {
+			parameters.insert_or_assign("orderLinkId", orderLinkId);
+		}
+
+		if (!cursor.empty()) {
+			parameters.insert_or_assign("cursor", cursor);
+		}
+
+		m_p->rateLimiter.wait();
+		const auto response = m_p->checkResponse(m_p->session()->get(path, parameters));
+		const auto result = handleBybitResponse<Response>(response).result;
+
+		if (result.contains("list") && result["list"].is_array()) {
+			for (const auto &el: result["list"]) {
+				EventExecution execution;
+				execution.fromJson(el);
+				executions.push_back(execution);
+			}
+		}
+
+		std::string nextCursor;
+		readValue<std::string>(result, "nextPageCursor", nextCursor);
+
+		/// An empty cursor ends the listing; a repeated one would loop forever
+		if (nextCursor.empty() || nextCursor == cursor) {
+			break;
+		}
+
+		cursor = nextCursor;
 	}
 
 	return executions;
