@@ -945,6 +945,7 @@ std::vector<EventExecution> RESTClient::getExecutions(const Category category, c
 
 	std::vector<EventExecution> executions;
 	std::string cursor;
+	bool listingComplete = false;
 
 	for (int page = 0; page < MAX_PAGES; page++) {
 		std::map<std::string, std::string> parameters;
@@ -978,12 +979,30 @@ std::vector<EventExecution> RESTClient::getExecutions(const Category category, c
 		std::string nextCursor;
 		readValue<std::string>(result, "nextPageCursor", nextCursor);
 
-		/// An empty cursor ends the listing; a repeated one would loop forever
-		if (nextCursor.empty() || nextCursor == cursor) {
+		/// An empty cursor is the only end of the listing that means the caller
+		/// holds every execution.
+		if (nextCursor.empty()) {
+			listingComplete = true;
 			break;
 		}
 
+		/// A repeated cursor would loop forever, and the page cap can be reached
+		/// with the venue still offering more. Both leave executions the caller
+		/// has not seen, and this feed reconciles fills the WS stream missed, so
+		/// an understated result would silently leave a real fill uncredited.
+		/// Fail closed rather than pass a partial vector off as the whole list.
+		if (nextCursor == cursor) {
+			throw std::runtime_error(
+				fmt::format("Bybit execution list repeated its page cursor after {} executions", executions.size()));
+		}
+
 		cursor = nextCursor;
+	}
+
+	if (!listingComplete) {
+		throw std::runtime_error(
+			fmt::format("Bybit execution list exceeded {} pages and is still incomplete after {} executions",
+			            MAX_PAGES, executions.size()));
 	}
 
 	return executions;
