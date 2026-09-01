@@ -13,17 +13,14 @@ Copyright (c) 2022 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "nlohmann/json.hpp"
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/ssl/host_name_verification.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/beast/version.hpp>
 #include <openssl/hmac.h>
 #include <spdlog/spdlog.h>
-#ifndef _WIN32
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#endif
 #include <atomic>
+#include <chrono>
 #include <limits>
+#include <utility>
 
 namespace stonky::bybit {
 namespace ssl = boost::asio::ssl;
@@ -35,74 +32,43 @@ auto API_TESTNET_URI = "api-testnet.bybit.com";
 /// How often the local clock is re-synchronized against the exchange clock
 static constexpr std::int64_t TIME_SYNC_INTERVAL_MS = 30 * 60 * 1000;
 
-/// Stall bound for a dead peer or black-holed route, which would otherwise
-/// block the calling worker for the OS default (minutes) — past funding cutoffs
-/// and scheduler slots the chase deadlines are supposed to protect. Applied per
-/// connection, so a large-but-flowing archive download never trips it; only a
-/// genuine stall does. It surfaces as a boost system_error inside the request
-/// try-block → TransportError (outcome unknown), which is exactly right: a
-/// timed-out order POST may still have been executed.
-///
-/// SO_RCVTIMEO/SO_SNDTIMEO alone do NOT deliver that on POSIX — a timed-out
-/// recv reports EAGAIN and Asio's synchronous path polls on without a deadline —
-/// so the kernel-level settings below are what actually bound it there. The
-/// connect itself is bounded only by the kernel's SYN retries; bounding it
-/// explicitly needs the synchronous request path rewritten to async operations
-/// driven by io_context::run_for.
-///
-/// The connect itself is only bounded on POSIX, where a blocking connect honors SO_SNDTIMEO; Windows falls back to
-/// the operating system connect timeout there. On Windows SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds
-/// instead of a timeval, and the winsock declarations come in through Boost.Asio, which must be included first.
-static constexpr int IO_STALL_TIMEOUT_S = 15;
-
 namespace {
-/// @param timeoutMs per syscall bound; 0 or less falls back to IO_STALL_TIMEOUT_S
-void setSocketStallTimeouts(tcp::socket& socket, const int timeoutMs) {
-    const auto effectiveMs = timeoutMs > 0 ? timeoutMs : IO_STALL_TIMEOUT_S * 1000;
+template<typename Start, typename Cancel>
+boost::system::error_code runTimedOperation(net::io_context& ioc, const int timeoutMs,
+                                            Start start, Cancel cancel) {
+    boost::system::error_code operationError = net::error::operation_aborted;
+    bool finished = false;
+    bool timedOut = false;
+    net::steady_timer timer{ioc};
+    if (timeoutMs > 0) {
+        timer.expires_after(std::chrono::milliseconds(timeoutMs));
+    } else {
+        timer.expires_at(net::steady_timer::clock_type::time_point::max());
+    }
+    timer.async_wait([&](const boost::system::error_code& ec) {
+        if (!ec && !finished) {
+            timedOut = true;
+            cancel();
+        }
+    });
+    start([&](const boost::system::error_code& ec) {
+        operationError = ec;
+        finished = true;
+        (void) timer.cancel();
+    });
+    ioc.restart();
+    ioc.run();
+    return timedOut ? make_error_code(net::error::timed_out) : operationError;
+}
 
-#ifdef _WIN32
-    const DWORD value = static_cast<DWORD>(effectiveMs);
-    const auto data = reinterpret_cast<const char*>(&value);
-    const int size = sizeof(value);
-#else
-    const timeval value{.tv_sec = effectiveMs / 1000, .tv_usec = effectiveMs % 1000 * 1000};
-    const auto data = reinterpret_cast<const void*>(&value);
-    const socklen_t size = sizeof(value);
-#endif
-
-    ::setsockopt(socket.native_handle(), SOL_SOCKET, SO_RCVTIMEO, data, size);
-    ::setsockopt(socket.native_handle(), SOL_SOCKET, SO_SNDTIMEO, data, size);
-
-#ifndef _WIN32
-    // SO_RCVTIMEO/SO_SNDTIMEO do not bound a synchronous Boost.Asio operation on
-    // POSIX: a timed-out recv reports EAGAIN, which Asio cannot tell from a
-    // non-blocking would-block, so it polls with no deadline and waits anyway.
-    // What does bound a peer that has gone silent is the kernel giving up on the
-    // connection: keepalive probes on an idle socket and TCP_USER_TIMEOUT on
-    // unacknowledged data both end in ETIMEDOUT, a real error the synchronous
-    // call reports. Roughly a minute, per connection rather than per transfer,
-    // so a large transfer that keeps flowing is unaffected.
-    const int handle = socket.native_handle();
-    constexpr int enable = 1;
-    ::setsockopt(handle, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
-#ifdef TCP_KEEPIDLE
-    constexpr int idleSeconds = 30;
-    constexpr int probeIntervalSeconds = 10;
-    constexpr int probeCount = 3;
-    ::setsockopt(handle, IPPROTO_TCP, TCP_KEEPIDLE, &idleSeconds, sizeof(idleSeconds));
-    ::setsockopt(handle, IPPROTO_TCP, TCP_KEEPINTVL, &probeIntervalSeconds, sizeof(probeIntervalSeconds));
-    ::setsockopt(handle, IPPROTO_TCP, TCP_KEEPCNT, &probeCount, sizeof(probeCount));
-#endif
-#ifdef TCP_USER_TIMEOUT
-    constexpr unsigned int unackedMs = 60000;
-    ::setsockopt(handle, IPPROTO_TCP, TCP_USER_TIMEOUT, &unackedMs, sizeof(unackedMs));
-#endif
-#endif
+void throwIfError(const boost::system::error_code& ec) {
+    if (ec) {
+        throw boost::system::system_error{ec};
+    }
 }
 } // namespace
 
 struct HTTPSession::P {
-    net::io_context ioc;
     std::string apiKey;
     /// Bybit's own default. A wider window only means that a badly delayed request can still be executed, which
     /// the clock synchronization below makes unnecessary.
@@ -116,7 +82,7 @@ struct HTTPSession::P {
     mutable std::atomic<std::int64_t> timeOffsetMs{0};
     mutable std::atomic<std::int64_t> lastTimeSyncMs{0};
     std::atomic<std::int64_t> lastSuccessMs{0};
-    std::atomic<int> requestTimeoutMs{IO_STALL_TIMEOUT_S * 1000};
+    std::atomic<int> requestTimeoutMs{DEFAULT_REQUEST_TIMEOUT_MS};
     const HTTPSession* parent{nullptr};
 
     P() : evpMd(EVP_sha256()) {}
@@ -285,6 +251,7 @@ http::response<http::string_body> HTTPSession::P::request(http::request<http::st
     ssl::context ctx{ssl::context::sslv23_client};
     enableTlsPeerVerification(ctx);
 
+    net::io_context ioc;
     tcp::resolver resolver{ioc};
     ssl::stream<tcp::socket> stream{ioc, ctx};
     stream.set_verify_callback(ssl::host_name_verification(uri));
@@ -304,40 +271,74 @@ http::response<http::string_body> HTTPSession::P::request(http::request<http::st
     /// Everything below can fail without the exchange ever seeing the request - or after it has seen it. The caller
     /// must be able to tell that apart from a rejection, hence the dedicated exception type.
     try {
-        auto const results = resolver.resolve(uri, "443");
-
-        /// Manual endpoint loop instead of net::connect: the stall timeouts
-        /// must be set on the OPEN socket before connect so they also bound
-        /// the connect itself (Linux honors SO_SNDTIMEO for blocking connect).
-        auto& socket = stream.next_layer();
-        boost::system::error_code connectEc = net::error::host_not_found;
-
-        for (const auto& entry: results) {
-            boost::system::error_code ec;
-            socket.close(ec);
-            socket.open(entry.endpoint().protocol(), ec);
-
-            if (ec) {
-                connectEc = ec;
-                continue;
-            }
-
-            setSocketStallTimeouts(socket, requestTimeoutMs);
-            socket.connect(entry.endpoint(), ec);
-            connectEc = ec;
-
-            if (!ec) {
-                break;
-            }
+        const auto timeoutMs = requestTimeoutMs.load();
+        tcp::resolver::results_type results;
+        throwIfError(runTimedOperation(
+            ioc, timeoutMs,
+            [&](auto complete) {
+                resolver.async_resolve(
+                    uri, "443",
+                    [&, complete](const boost::system::error_code& ec,
+                                  tcp::resolver::results_type resolved) {
+                        if (!ec) {
+                            results = std::move(resolved);
+                        }
+                        complete(ec);
+                    });
+            },
+            [&] { resolver.cancel(); }));
+        throwIfError(runTimedOperation(
+            ioc, timeoutMs,
+            [&](auto complete) {
+                net::async_connect(
+                    stream.next_layer(), results,
+                    [complete](const boost::system::error_code& ec, const tcp::endpoint&) {
+                        complete(ec);
+                    });
+            },
+            [&] {
+                boost::system::error_code ignored;
+                stream.next_layer().cancel(ignored);
+            }));
+        throwIfError(runTimedOperation(
+            ioc, timeoutMs,
+            [&](auto complete) {
+                stream.async_handshake(
+                    ssl::stream_base::client,
+                    [complete](const boost::system::error_code& ec) { complete(ec); });
+            },
+            [&] {
+                boost::system::error_code ignored;
+                stream.next_layer().cancel(ignored);
+            }));
+        throwIfError(runTimedOperation(
+            ioc, timeoutMs,
+            [&](auto complete) {
+                http::async_write(
+                    stream, req,
+                    [complete](const boost::system::error_code& ec, const std::size_t) {
+                        complete(ec);
+                    });
+            },
+            [&] {
+                boost::system::error_code ignored;
+                stream.next_layer().cancel(ignored);
+            }));
+        while (!parser.is_done()) {
+            throwIfError(runTimedOperation(
+                ioc, timeoutMs,
+                [&](auto complete) {
+                    http::async_read_some(
+                        stream, buffer, parser,
+                        [complete](const boost::system::error_code& ec, const std::size_t) {
+                            complete(ec);
+                        });
+                },
+                [&] {
+                    boost::system::error_code ignored;
+                    stream.next_layer().cancel(ignored);
+                }));
         }
-
-        if (connectEc) {
-            throw boost::system::system_error{connectEc};
-        }
-
-        stream.handshake(ssl::stream_base::client);
-        http::write(stream, req);
-        http::read(stream, buffer, parser);
     } catch (const boost::system::system_error& e) {
         throw TransportError(fmt::format("Transport failure for {}: {}", std::string(req.target()), e.what()));
     }
@@ -345,12 +346,19 @@ http::response<http::string_body> HTTPSession::P::request(http::request<http::st
     auto response = parser.release();
     lastSuccessMs = getMsTimestamp(currentTime()).count();
 
-    boost::system::error_code ec;
-    [[maybe_unused]] const auto rc = stream.shutdown(ec);
-    if (ec == boost::asio::error::eof) {
-        // Rationale:
-        // http://stackoverflow.com/questions/25587403/boost-asio-ssl-async-shutdown-always-finishes-with-an-error
-        ec.assign(0, ec.category());
+    try {
+        (void) runTimedOperation(
+            ioc, requestTimeoutMs.load(),
+            [&](auto complete) {
+                stream.async_shutdown(
+                    [complete](const boost::system::error_code& ec) { complete(ec); });
+            },
+            [&] {
+                boost::system::error_code ignored;
+                stream.next_layer().cancel(ignored);
+            });
+    } catch (...) {
+        // The complete HTTP response is authoritative; TLS close is best-effort.
     }
 
     return response;
