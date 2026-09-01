@@ -19,6 +19,8 @@ Copyright (c) 2022 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #endif
 #include <atomic>
 #include <limits>
@@ -33,14 +35,20 @@ auto API_TESTNET_URI = "api-testnet.bybit.com";
 /// How often the local clock is re-synchronized against the exchange clock
 static constexpr std::int64_t TIME_SYNC_INTERVAL_MS = 30 * 60 * 1000;
 
-/// Stall timeout for every blocking socket syscall (connect, TLS handshake,
-/// write, each read). Without it a dead peer/black-holed route blocks the
-/// calling worker for the OS default (minutes) — past funding cutoffs and
-/// scheduler slots the chase deadlines are supposed to protect. Applied per
-/// syscall, so a large-but-flowing archive download never trips it; only a
-/// genuine stall does. Timeouts surface as boost system_errors inside the
-/// request try-block → TransportError (outcome unknown), which is exactly
-/// right: a timed-out order POST may still have been executed.
+/// Stall bound for a dead peer or black-holed route, which would otherwise
+/// block the calling worker for the OS default (minutes) — past funding cutoffs
+/// and scheduler slots the chase deadlines are supposed to protect. Applied per
+/// connection, so a large-but-flowing archive download never trips it; only a
+/// genuine stall does. It surfaces as a boost system_error inside the request
+/// try-block → TransportError (outcome unknown), which is exactly right: a
+/// timed-out order POST may still have been executed.
+///
+/// SO_RCVTIMEO/SO_SNDTIMEO alone do NOT deliver that on POSIX — a timed-out
+/// recv reports EAGAIN and Asio's synchronous path polls on without a deadline —
+/// so the kernel-level settings below are what actually bound it there. The
+/// connect itself is bounded only by the kernel's SYN retries; bounding it
+/// explicitly needs the synchronous request path rewritten to async operations
+/// driven by io_context::run_for.
 ///
 /// The connect itself is only bounded on POSIX, where a blocking connect honors SO_SNDTIMEO; Windows falls back to
 /// the operating system connect timeout there. On Windows SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds
@@ -64,6 +72,32 @@ void setSocketStallTimeouts(tcp::socket& socket, const int timeoutMs) {
 
     ::setsockopt(socket.native_handle(), SOL_SOCKET, SO_RCVTIMEO, data, size);
     ::setsockopt(socket.native_handle(), SOL_SOCKET, SO_SNDTIMEO, data, size);
+
+#ifndef _WIN32
+    // SO_RCVTIMEO/SO_SNDTIMEO do not bound a synchronous Boost.Asio operation on
+    // POSIX: a timed-out recv reports EAGAIN, which Asio cannot tell from a
+    // non-blocking would-block, so it polls with no deadline and waits anyway.
+    // What does bound a peer that has gone silent is the kernel giving up on the
+    // connection: keepalive probes on an idle socket and TCP_USER_TIMEOUT on
+    // unacknowledged data both end in ETIMEDOUT, a real error the synchronous
+    // call reports. Roughly a minute, per connection rather than per transfer,
+    // so a large transfer that keeps flowing is unaffected.
+    const int handle = socket.native_handle();
+    constexpr int enable = 1;
+    ::setsockopt(handle, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
+#ifdef TCP_KEEPIDLE
+    constexpr int idleSeconds = 30;
+    constexpr int probeIntervalSeconds = 10;
+    constexpr int probeCount = 3;
+    ::setsockopt(handle, IPPROTO_TCP, TCP_KEEPIDLE, &idleSeconds, sizeof(idleSeconds));
+    ::setsockopt(handle, IPPROTO_TCP, TCP_KEEPINTVL, &probeIntervalSeconds, sizeof(probeIntervalSeconds));
+    ::setsockopt(handle, IPPROTO_TCP, TCP_KEEPCNT, &probeCount, sizeof(probeCount));
+#endif
+#ifdef TCP_USER_TIMEOUT
+    constexpr unsigned int unackedMs = 60000;
+    ::setsockopt(handle, IPPROTO_TCP, TCP_USER_TIMEOUT, &unackedMs, sizeof(unackedMs));
+#endif
+#endif
 }
 } // namespace
 
