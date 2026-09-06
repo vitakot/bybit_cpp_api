@@ -390,18 +390,26 @@ public:
 		return response;
 	}
 
+	/// @param endTime  0 leaves the request open-ended. A positive value anchors
+	///                 the venue's fixed window at it: the response is the newest
+	///                 `limit` candles at or before endTime, which is what makes
+	///                 probing an empty stretch possible (see the public overload).
 	[[nodiscard]] std::vector<Candle>
 	getHistoricalPrices(const Category category,
 	                    const std::string &symbol,
 	                    const CandleInterval interval,
 	                    const std::int64_t startTime,
-	                    const std::int32_t limit) const {
+	                    const std::int32_t limit,
+	                    const std::int64_t endTime = 0) const {
 		const std::string path = "/v5/market/kline";
 		std::map<std::string, std::string> parameters;
 		parameters.insert_or_assign("category", magic_enum::enum_name(category));
 		parameters.insert_or_assign("symbol", symbol);
 		parameters.insert_or_assign("interval", magic_enum::enum_name(interval));
 		parameters.insert_or_assign("start", std::to_string(startTime));
+		if (endTime > 0) {
+			parameters.insert_or_assign("end", std::to_string(endTime));
+		}
 
 		if (limit != 200) {
 			parameters.insert_or_assign("limit", std::to_string(limit));
@@ -506,14 +514,45 @@ RESTClient::getHistoricalPrices(const Category category,
 
 		std::ranges::reverse(candles);
 
-		// For delisted spot symbols, Bybit ignores the 'start' parameter and always
-		// returns its fixed last-N-candles window.  When the batch therefore starts
-		// before 'from', we have two cases:
-		//  a) The batch is entirely before 'from' — no new data, stop.
-		//  b) The batch straddles 'from' — discard the stale prefix and continue.
+		// When no candle exists at or after 'start', Bybit does not answer with an
+		// empty list: it returns its fixed window of the newest candles BEFORE
+		// 'start' instead. A batch that starts before 'from' therefore has two
+		// cases:
+		//  a) The batch straddles 'from' — discard the stale prefix and continue.
+		//  b) The batch is entirely before 'from'. That is the end of the history
+		//     for a delisted symbol — but it is also what a symbol that was
+		//     delisted and later relisted looks like when 'from' sits in the gap
+		//     between its two listings: SHIBUSDT's first listing ends 2021-11-29,
+		//     the second starts 2021-12-07, and every 'start' in between draws the
+		//     2021-11-29 window. Reading that as "no new data" froze the 1m history
+		//     of every relisted symbol at its first delisting for good (SHIB, LUNC,
+		//     USTC, ZKJ, GRAM). Probe forward instead: 'end' anchors the venue's
+		//     window, so a request for [from, from + limit intervals] answers with
+		//     everything in that window or with the pre-gap window again. An
+		//     empty window is skipped whole; the first window holding data is
+		//     complete by construction, because it is at most 'limit' wide.
 		if (candles.front().startTime < from) {
 			if (candles.back().startTime < from) {
-				break; // Entire batch predates 'from'; no new data available.
+				// limit - 1 intervals: [from, windowEnd] is inclusive, so this is exactly
+				// 'limit' slots and a full window still fits one response.
+				const auto windowMs = static_cast<std::int64_t>(limit - 1) * Bybit::numberOfMsForCandleInterval(interval);
+				// ponytail: 2000 windows = 277 days at 1m, 45 years at 1h; a
+				// listing gap is days. Beyond it the venue really has nothing.
+				constexpr int maxGapWindows = 2000;
+				bool found = false;
+				for (int window = 0; window < maxGapWindows && from <= to; ++window) {
+					const auto windowEnd = std::min(to, from + windowMs);
+					candles = m_p->getHistoricalPrices(category, symbol, interval, from, limit, windowEnd);
+					std::ranges::reverse(candles);
+					if (!candles.empty() && candles.back().startTime >= from) {
+						found = true;
+						break;
+					}
+					from = windowEnd + 1; // window proven empty, step past it
+				}
+				if (!found) {
+					break; // Nothing at or after 'from' anywhere up to 'to'.
+				}
 			}
 			// Trim candles that predate 'from'.
 			const auto firstValid = std::lower_bound(candles.begin(), candles.end(), from,
