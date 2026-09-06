@@ -536,11 +536,10 @@ RESTClient::getHistoricalPrices(const Category category,
 				// limit - 1 intervals: [from, windowEnd] is inclusive, so this is exactly
 				// 'limit' slots and a full window still fits one response.
 				const auto windowMs = static_cast<std::int64_t>(limit - 1) * Bybit::numberOfMsForCandleInterval(interval);
-				// ponytail: 2000 windows = 277 days at 1m, 45 years at 1h; a
-				// listing gap is days. Beyond it the venue really has nothing.
-				constexpr int maxGapWindows = 2000;
+				// Only the requested end bounds the scan: even a long empty stretch
+				// can be followed by a relisting, so a probe count cannot prove EOF.
 				bool found = false;
-				for (int window = 0; window < maxGapWindows && from <= to; ++window) {
+				while (from <= to) {
 					const auto windowEnd = std::min(to, from + windowMs);
 					candles = m_p->getHistoricalPrices(category, symbol, interval, from, limit, windowEnd);
 					std::ranges::reverse(candles);
